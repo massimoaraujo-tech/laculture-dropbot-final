@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup
+import cloudscraper
 
 # ============================== CONFIG ======================================
 
@@ -171,7 +172,9 @@ def parse_products_from_html(html):
 
     return products
 
-SESSION = requests.Session()
+SESSION = cloudscraper.create_scraper(
+    browser={"browser": "chrome", "platform": "windows", "mobile": False}
+)
 SESSION.headers.update(HEADERS)
 _session_warmed = False
 
