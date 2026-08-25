@@ -31,8 +31,10 @@ import requests
 
 # ============================== CONFIG ======================================
 
-# Paste your Discord webhook URL here (Server Settings > Integrations > Webhooks)
-DISCORD_WEBHOOK_URL = "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE"
+# Paste your Discord webhook URL here for local testing, OR (recommended once
+# hosted) set it as an environment variable named DISCORD_WEBHOOK_URL instead
+# and leave the line below as-is — the environment variable will take priority.
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE")
 
 # Which Lemkus collections to watch. Add/remove as you like.
 # Find more collection handles by browsing lemkus.com and copying the
@@ -185,6 +187,15 @@ def main():
     first_run = len(state["products"]) == 0
     if first_run:
         log.info("First run — building baseline (no Discord alerts will fire this pass).")
+
+    # One-time startup ping so you can confirm the webhook works immediately,
+    # without waiting for a real drop or restock to happen naturally.
+    post_to_discord({
+        "title": "✅ Lemkus Alert Bot is online",
+        "description": f"Watching: {', '.join(COLLECTIONS)}\nChecking every {CHECK_INTERVAL_SECONDS}s.",
+        "color": 0x95A5A6,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
 
     while True:
         for handle in COLLECTIONS:
