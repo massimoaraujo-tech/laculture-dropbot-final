@@ -87,7 +87,7 @@ def post_to_discord(embed):
     except requests.RequestException as e:
         log.error("Failed to post to Discord: %s", e)
 
-def build_embed(product, collection_handle, kind, variant_title=None):
+def build_embed(product, collection_handle, kind, all_available_sizes=None, changed_sizes=None):
     product_url = f"{BASE_URL}/products/{product['handle']}"
     price = None
     try:
@@ -99,29 +99,55 @@ def build_embed(product, collection_handle, kind, variant_title=None):
     if product.get("images"):
         image_url = product["images"][0].get("src")
 
+    all_available_sizes = all_available_sizes or []
+    changed_sizes = changed_sizes or []
+
     if kind == "new":
         title = f"🆕 New Drop: {product['title']}"
         color = 0x2ECC71  # green
     else:
         title = f"🔁 Restock: {product['title']}"
-        if variant_title:
-            title += f" ({variant_title})"
         color = 0x3498DB  # blue
+
+    fields = [
+        {"name": "Price", "value": price or "N/A", "inline": True},
+        {"name": "Collection", "value": collection_handle, "inline": True},
+    ]
+
+    if kind == "restock" and changed_sizes:
+        fields.append({
+            "name": "🔥 Just Restocked",
+            "value": ", ".join(sorted(changed_sizes, key=_size_sort_key)),
+            "inline": False,
+        })
+
+    if all_available_sizes:
+        fields.append({
+            "name": f"Sizes In Stock ({len(all_available_sizes)})",
+            "value": ", ".join(sorted(all_available_sizes, key=_size_sort_key)),
+            "inline": False,
+        })
+    else:
+        fields.append({"name": "Stock", "value": "No sizes currently available", "inline": False})
 
     embed = {
         "title": title,
         "url": product_url,
         "color": color,
-        "fields": [
-            {"name": "Price", "value": price or "N/A", "inline": True},
-            {"name": "Collection", "value": collection_handle, "inline": True},
-        ],
+        "fields": fields,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer": {"text": "Lemkus Alert Bot"},
+        "footer": {"text": "Lemkus Alert Bot • Lemkus doesn't publish exact unit counts, only in/out of stock per size"},
     }
     if image_url:
         embed["thumbnail"] = {"url": image_url}
     return embed
+
+def _size_sort_key(size_str):
+    """Sort sizes numerically where possible (so '9' < '10', not '10' < '9')."""
+    try:
+        return (0, float(size_str))
+    except (TypeError, ValueError):
+        return (1, str(size_str))
 
 # ============================== SCRAPE (JSON) ================================
 
@@ -143,6 +169,7 @@ def fetch_collection_products(handle):
         page += 1
     return products
 
+
 # ============================== CORE LOGIC ===================================
 
 def check_collection(handle, state):
@@ -154,30 +181,36 @@ def check_collection(handle, state):
 
     for product in products:
         pid = str(product["id"])
-        available_variant_ids = [
-            str(v["id"]) for v in product.get("variants", []) if v.get("available")
-        ]
+        variants = product.get("variants", [])
+
+        # Map variant id -> size label (Shopify usually puts size in variant "title"
+        # or "option1" — fall back gracefully if the store structures it differently).
+        size_labels = {str(v["id"]): (v.get("title") or v.get("option1") or "One Size") for v in variants}
+        available_variant_ids = [str(v["id"]) for v in variants if v.get("available")]
+        available_sizes = [size_labels[vid] for vid in available_variant_ids]
 
         existing = state["products"].get(pid)
 
         if existing is None:
             # Brand new product we've never seen before
             state["products"][pid] = {"available_variants": available_variant_ids}
-            post_to_discord(build_embed(product, handle, "new"))
-            log.info("New product: %s", product["title"])
+            post_to_discord(build_embed(product, handle, "new", all_available_sizes=available_sizes))
+            log.info("New product: %s (%d size(s) in stock)", product["title"], len(available_sizes))
             continue
 
         # Check for restocked variants (previously unavailable, now available)
         prev_available = set(existing.get("available_variants", []))
         now_available = set(available_variant_ids)
-        newly_available = now_available - prev_available
+        newly_available_ids = now_available - prev_available
 
-        if newly_available:
-            variant_lookup = {str(v["id"]): v.get("title") for v in product.get("variants", [])}
-            for vid in newly_available:
-                variant_title = variant_lookup.get(vid)
-                post_to_discord(build_embed(product, handle, "restock", variant_title))
-            log.info("Restock: %s (%d size(s))", product["title"], len(newly_available))
+        if newly_available_ids:
+            newly_available_sizes = [size_labels[vid] for vid in newly_available_ids]
+            post_to_discord(build_embed(
+                product, handle, "restock",
+                all_available_sizes=available_sizes,
+                changed_sizes=newly_available_sizes,
+            ))
+            log.info("Restock: %s -> %s", product["title"], ", ".join(newly_available_sizes))
 
         existing["available_variants"] = available_variant_ids
 
