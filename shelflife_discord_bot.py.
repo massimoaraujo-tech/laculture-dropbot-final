@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+Shelflife SA -> Discord Alert Bot
+-----------------------------------
+Shelflife (shelflife.co.za) isn't built on Shopify like Lemkus, so there's no
+public /products.json feed to poll. This bot instead reads their "Sneakers"
+category page sorted by Latest, and posts to a Discord webhook whenever a
+brand new product appears that wasn't there on the last check.
+
+Scope (per your request): NEW DROPS ONLY. Shelflife's listing pages don't
+expose per-size stock/sold-out info, so reliable restock detection isn't
+practical here the way it is for Lemkus — skipped entirely.
+
+⚠️ Fragility note: because this reads the actual webpage HTML (not a clean
+API), if Shelflife redesigns their site layout, the parsing in
+`parse_products_from_html()` may need small updates. If it silently stops
+finding new products, that's the first place to check.
+
+SETUP (same pattern as the Lemkus bot):
+  1. In Discord: create a NEW webhook for your new Shelflife channel
+     (Channel Settings -> Integrations -> Webhooks -> New Webhook -> Copy URL).
+  2. Set DISCORD_WEBHOOK_URL as an environment variable (Railway Variables
+     tab) — or paste it directly below for local testing.
+  3. pip install requests beautifulsoup4
+  4. python shelflife_discord_bot.py
+"""
+
+import json
+import os
+import re
+import time
+import logging
+from datetime import datetime, timezone
+
+import requests
+from bs4 import BeautifulSoup
+
+# ============================== CONFIG ======================================
+
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE")
+
+BASE_URL = "https://www.shelflife.co.za"
+
+# "Latest" sort on the all-sneakers category page. Change /all/ to /men/,
+# /women/, or /kids/ if you ever want to narrow this down.
+LATEST_SNEAKERS_URL = f"{BASE_URL}/category/all/footwear/sneakers?sortBy=activated&sortOrder=desc"
+
+# How many listing pages to check each cycle. Latest-sorted, so page 1 alone
+# usually covers it — 2 is a small safety margin in case several items drop
+# between checks.
+PAGES_TO_CHECK = 2
+
+CHECK_INTERVAL_SECONDS = 180          # 3 min — a bit gentler than Lemkus since this is HTML, not an API
+STATE_FILE = "shelflife_state.json"
+REQUEST_TIMEOUT = 20
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; ShelflifeAlertBot/1.0; +personal use)"
+}
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("shelflife-bot")
+
+PRICE_RE = re.compile(r"R\s?[\d,]+\.\d{2}")
+
+# ============================== STATE ========================================
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"seen_slugs": []}
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+# ============================== DISCORD ======================================
+
+def post_to_discord(embed):
+    if "PASTE_YOUR" in DISCORD_WEBHOOK_URL:
+        log.warning("DISCORD_WEBHOOK_URL is not set — skipping post. %s", embed.get("title"))
+        return
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=REQUEST_TIMEOUT)
+        if resp.status_code >= 300:
+            log.error("Discord webhook error %s: %s", resp.status_code, resp.text[:300])
+    except requests.RequestException as e:
+        log.error("Failed to post to Discord: %s", e)
+
+def build_embed(product):
+    embed = {
+        "title": f"🆕 New Drop: {product['name']}",
+        "url": product["url"],
+        "color": 0x2ECC71,
+        "fields": [
+            {"name": "Brand", "value": product.get("brand") or "N/A", "inline": True},
+            {"name": "Price", "value": product.get("price") or "N/A", "inline": True},
+        ],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "footer": {"text": "Shelflife Alert Bot"},
+    }
+    if product.get("image"):
+        embed["thumbnail"] = {"url": product["image"]}
+    return embed
+
+# ============================== SCRAPE (HTML) ================================
+
+def parse_products_from_html(html):
+    """
+    Heuristic parser: Shelflife doesn't expose a JSON feed, so we read the
+    rendered product grid directly. For each product, the title is an <a>
+    tag linking to /product/<slug> with visible text (the product name).
+    We then look at nearby elements for price and brand, and for an <img>
+    tag pointing to the same product link for the thumbnail.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    products = []
+    seen_on_page = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not href.startswith("/product/"):
+            continue
+        name = a.get_text(strip=True)
+        if not name:
+            continue  # this is likely the image-wrapping link, not the title link
+
+        slug = href.split("?")[0].rstrip("/")
+        if slug in seen_on_page:
+            continue
+        seen_on_page.add(slug)
+
+        # Walk up a few parent levels looking for a container that also has
+        # a price string nearby — that's almost certainly the product card.
+        price = None
+        brand = None
+        image = None
+        node = a
+        for _ in range(4):
+            if node.parent is None:
+                break
+            node = node.parent
+            text_blob = node.get_text(separator="|")
+            price_match = PRICE_RE.search(text_blob)
+            if price_match and not price:
+                price = price_match.group(0)
+            if not image:
+                img_tag = node.find("img", src=True)
+                if img_tag:
+                    image = img_tag["src"]
+            if not brand:
+                bold_tag = node.find(["b", "strong"])
+                if bold_tag and bold_tag.get_text(strip=True):
+                    brand = bold_tag.get_text(strip=True)
+            if price and image and brand:
+                break
+
+        products.append({
+            "slug": slug,
+            "name": name,
+            "url": f"{BASE_URL}{slug}",
+            "price": price,
+            "brand": brand,
+            "image": image,
+        })
+
+    return products
+
+def fetch_latest_sneakers():
+    all_products = []
+    for page in range(1, PAGES_TO_CHECK + 1):
+        sep = "&" if "?" in LATEST_SNEAKERS_URL else "?"
+        url = f"{LATEST_SNEAKERS_URL}{sep}page={page}"
+        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        page_products = parse_products_from_html(resp.text)
+        if not page_products:
+            break
+        all_products.extend(page_products)
+    return all_products
+
+# ============================== CORE LOGIC ===================================
+
+def check_for_new_drops(state):
+    try:
+        products = fetch_latest_sneakers()
+    except requests.RequestException as e:
+        log.error("Failed to fetch Shelflife sneakers page: %s", e)
+        return
+    except Exception as e:
+        log.error("Failed to parse Shelflife page (site layout may have changed): %s", e)
+        return
+
+    if not products:
+        log.warning("No products parsed this cycle — Shelflife's page layout may have changed.")
+        return
+
+    seen = set(state["seen_slugs"])
+    new_products = [p for p in products if p["slug"] not in seen]
+
+    for product in new_products:
+        post_to_discord(build_embed(product))
+        log.info("New drop: %s", product["name"])
+        state["seen_slugs"].append(product["slug"])
+
+    # Keep the seen list from growing forever — cap it, keeping the most recent.
+    if len(state["seen_slugs"]) > 1000:
+        state["seen_slugs"] = state["seen_slugs"][-1000:]
+
+def main():
+    state = load_state()
+    first_run = len(state["seen_slugs"]) == 0
+    log.info("Starting Shelflife alert bot (new drops only). Checking every %ss.", CHECK_INTERVAL_SECONDS)
+
+    post_to_discord({
+        "title": "✅ Shelflife Alert Bot is online",
+        "description": f"Watching: Sneakers (all)\nChecking every {CHECK_INTERVAL_SECONDS}s.",
+        "color": 0x95A5A6,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+    while True:
+        if first_run:
+            try:
+                products = fetch_latest_sneakers()
+                state["seen_slugs"] = [p["slug"] for p in products]
+                log.info("First run — baseline built with %d product(s). No alerts fired this pass.", len(products))
+            except requests.RequestException as e:
+                log.error("Baseline fetch failed: %s", e)
+            first_run = False
+        else:
+            check_for_new_drops(state)
+
+        save_state(state)
+        log.info("Sleeping %ss...", CHECK_INTERVAL_SECONDS)
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
+if __name__ == "__main__":
+    main()
