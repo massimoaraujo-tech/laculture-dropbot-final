@@ -50,21 +50,42 @@ COLLECTIONS = [
     "footwear",
 ]
 
-# How often to check, in seconds. TEMPORARILY set to 20s for today's expected
-# drop (Sept 4). Change this back to 60 once today's drop has happened/passed
-# — checking every 20s indefinitely is unnecessarily aggressive and impolite
-# to Shopify's servers for a normal day.
-CHECK_INTERVAL_SECONDS = 20
+# How often to check, in seconds. Backed off to 45s while the site's bot
+# protection is being worked around — hammering an active block every 20s
+# doesn't help and can make detection systems more aggressive. Once this is
+# confirmed working, feel free to lower it again around a known drop time.
+CHECK_INTERVAL_SECONDS = 45
 
 STATE_FILE = "travisscott_state.json"
 REQUEST_TIMEOUT = 15
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; TravisScottAlertBot/1.0; +personal use)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://shop.travisscott.com/",
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("travisscott-bot")
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+_session_warmed = False
+
+def _warm_session():
+    """Visit the homepage first so we pick up any cookies the store's bot
+    protection expects before hitting collection JSON directly. This is the
+    same fix that got Denim Tears' harder Shopify setup working."""
+    global _session_warmed
+    if _session_warmed:
+        return
+    try:
+        SESSION.get(BASE_URL, timeout=REQUEST_TIMEOUT)
+        _session_warmed = True
+    except requests.RequestException as e:
+        log.warning("Could not warm session against homepage: %s", e)
 
 # ============================== STATE ========================================
 
@@ -155,12 +176,13 @@ def build_embed(product, collection_handle, kind, all_available_sizes=None, chan
 # ============================== SCRAPE (JSON) ================================
 
 def fetch_collection_products(handle):
+    _warm_session()
     products = []
     page = 1
     while True:
         url = f"{BASE_URL}/collections/{handle}/products.json"
         params = {"limit": 250, "page": page}
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json().get("products", [])
         if not data:
