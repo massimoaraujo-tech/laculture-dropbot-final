@@ -50,10 +50,11 @@ COLLECTIONS = [
     "footwear",
 ]
 
-# How often to check, in seconds. Default is a normal, polite interval.
-# Around a known big drop (like Sept 4), consider temporarily lowering this
-# to 20-30s for a short window, then raising it back afterward.
-CHECK_INTERVAL_SECONDS = 60
+# How often to check, in seconds. TEMPORARILY set to 20s for today's expected
+# drop (Sept 4). Change this back to 60 once today's drop has happened/passed
+# — checking every 20s indefinitely is unnecessarily aggressive and impolite
+# to Shopify's servers for a normal day.
+CHECK_INTERVAL_SECONDS = 20
 
 STATE_FILE = "travisscott_state.json"
 REQUEST_TIMEOUT = 15
