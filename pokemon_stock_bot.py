@@ -2,7 +2,7 @@
 """
 Pokemon Stock Tracker -> Discord Webhook
 
-Supports two store platforms:
+Supports three store platforms:
 
   WOOCOMMERCE (e.g. pokestore.co.za)
     Uses the built-in `?stock_status=instock&per_page=-1` filter to fetch
@@ -15,6 +15,12 @@ Supports two store platforms:
     ones, each with a status label. We track every product's stock status
     and alert the moment it flips from unavailable -> available. This
     catches restocks the WooCommerce approach can't see coming.
+
+  SHOPIFY (e.g. store.nintendo.co.za, toykingdom.co.za, levelupstore.co.za)
+    Same proven approach as the Lemkus/Nude Project/Denim Tears bots — reads
+    the public /products.json feed Shopify exposes on every collection.
+    Every variant's availability is checked, same restock detection as
+    Magento above.
 
 Runs continuously with its own built-in loop (same pattern as the other
 Discord alert bots in this repo) — deploy it on Railway the same way:
@@ -54,8 +60,23 @@ STORES = [
         "platform": "magento",
         "url": "https://www.toysrus.co.za/trading-cards-shop-all/pokemon?product_list_limit=100",
     },
-    # Add more stores here. Any WooCommerce or Magento shop works with zero
-    # code changes — just set "platform" and "url".
+    {
+        "name": "Nintendo SA — Pokémon TCG",
+        "platform": "shopify",
+        "url": "https://store.nintendo.co.za/collections/pokemon-tcg",
+    },
+    {
+        "name": "Toy Kingdom — Pokémon Cards",
+        "platform": "shopify",
+        "url": "https://toykingdom.co.za/collections/pokemon-cards",
+    },
+    {
+        "name": "Level Up Store — Pokémon Cards",
+        "platform": "shopify",
+        "url": "https://levelupstore.co.za/collections/pokemon-cards",
+    },
+    # Add more stores here. Any WooCommerce, Magento, or Shopify shop works
+    # with zero code changes — just set "platform" and "url".
 ]
 
 # How often to run a full check, in seconds.
@@ -162,9 +183,62 @@ def fetch_magento(store_url: str):
     return products
 
 
+# ---------------------------------------------------------------------------
+# Scraping — Shopify (Nintendo SA, Toy Kingdom, Level Up Store)
+# ---------------------------------------------------------------------------
+
+def fetch_shopify(store_url: str):
+    """store_url here is the base site URL plus the collection handle, e.g.
+    'https://store.nintendo.co.za/collections/pokemon-tcg'. We convert that
+    into the public /products.json feed Shopify exposes on every collection —
+    the same reliable approach used for Lemkus, Nude Project, and Denim Tears.
+    Every product's variants are checked for availability; a product counts
+    as in_stock if ANY variant is available."""
+    # Turn ".../collections/<handle>" into ".../collections/<handle>/products.json"
+    base = store_url.split("?")[0].rstrip("/")
+    json_url = f"{base}/products.json"
+
+    products = []
+    page = 1
+    while True:
+        resp = requests.get(json_url, params={"limit": 250, "page": page}, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json().get("products", [])
+        if not data:
+            break
+
+        for p in data:
+            variants = p.get("variants", [])
+            in_stock = any(v.get("available") for v in variants)
+            price = ""
+            try:
+                price = f"R{float(variants[0]['price']):,.2f}"
+            except (IndexError, KeyError, ValueError, TypeError):
+                pass
+            image = None
+            if p.get("images"):
+                image = p["images"][0].get("src")
+
+            # Reconstruct the product page URL from the store's root domain
+            root = "/".join(base.split("/")[:3])  # https://domain.com
+            link = f"{root}/products/{p['handle']}"
+
+            products.append({
+                "id": str(p["id"]), "name": p["title"], "price": price,
+                "link": link, "image": image, "in_stock": in_stock,
+            })
+
+        if len(data) < 250:
+            break
+        page += 1
+
+    return products
+
+
 PLATFORM_FETCHERS = {
     "woocommerce": fetch_woocommerce,
     "magento": fetch_magento,
+    "shopify": fetch_shopify,
 }
 
 
