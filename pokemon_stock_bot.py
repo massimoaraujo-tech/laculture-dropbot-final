@@ -16,11 +16,18 @@ Supports three store platforms:
     and alert the moment it flips from unavailable -> available. This
     catches restocks the WooCommerce approach can't see coming.
 
-  SHOPIFY (e.g. store.nintendo.co.za, toykingdom.co.za, levelupstore.co.za)
+  SHOPIFY (e.g. store.nintendo.co.za, toykingdom.co.za, levelupstore.co.za,
+           bigbangshop.co.za)
     Same proven approach as the Lemkus/Nude Project/Denim Tears bots — reads
     the public /products.json feed Shopify exposes on every collection.
     Every variant's availability is checked, same restock detection as
     Magento above.
+
+  GENERIC (e.g. gengargames.com — platform unconfirmed)
+    Best-effort fallback: looks for any product-like link with a price
+    nearby and checks for out-of-stock keywords in the surrounding text.
+    Less reliable than the platform-specific fetchers — check its first-run
+    logs closely; if it parses 0 products, its real markup needs inspecting.
 
 Runs continuously with its own built-in loop (same pattern as the other
 Discord alert bots in this repo) — deploy it on Railway the same way:
@@ -63,7 +70,7 @@ STORES = [
     {
         "name": "Nintendo SA — Pokémon TCG",
         "platform": "shopify",
-        "url": "https://store.nintendo.co.za/collections/pokemon-tcg",
+        "url": "https://store.nintendo.co.za/collections/pokemon-trading-cards",
     },
     {
         "name": "Toy Kingdom — Pokémon Cards",
@@ -75,8 +82,23 @@ STORES = [
         "platform": "shopify",
         "url": "https://levelupstore.co.za/collections/pokemon-cards",
     },
-    # Add more stores here. Any WooCommerce, Magento, or Shopify shop works
-    # with zero code changes — just set "platform" and "url".
+    {
+        "name": "Big Bang Shop — Pokémon TCG",
+        "platform": "shopify",
+        "url": "https://bigbangshop.co.za/collections/pokemon-trading-card-game",
+    },
+    {
+        "name": "ThunderBolt Gaming",
+        "platform": "woocommerce",
+        "url": "https://tbgaming.co.za/?stock_status=instock&per_page=-1",
+    },
+    {
+        "name": "Gengar Games",
+        "platform": "generic",
+        "url": "https://www.gengargames.com/pokemon-single-cards",
+    },
+    # Add more stores here. Any WooCommerce, Magento, Shopify, or generic
+    # shop works with zero code changes — just set "platform" and "url".
 ]
 
 # How often to run a full check, in seconds.
@@ -235,10 +257,72 @@ def fetch_shopify(store_url: str):
     return products
 
 
+# ---------------------------------------------------------------------------
+# Scraping — Generic best-effort (unconfirmed platforms, e.g. Gengar Games)
+# ---------------------------------------------------------------------------
+
+def fetch_generic(store_url: str):
+    """Best-effort fallback for stores whose exact platform isn't confirmed.
+    Looks for any product-card-like link with visible text, then checks the
+    surrounding container for a price and any out-of-stock keyword. Less
+    reliable than the platform-specific fetchers above — if this store
+    consistently parses 0 products, its real markup needs to be inspected
+    and a proper selector added."""
+    resp = requests.get(store_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    products = []
+    seen_links = set()
+    price_re = re.compile(r"R\s?[\d,]+\.\d{2}")
+
+    for a in soup.find_all("a", href=True):
+        name = a.get_text(strip=True)
+        if not name or len(name) < 3:
+            continue
+        href = a["href"]
+        if href in seen_links:
+            continue
+
+        # Walk up a few parent levels looking for a price and stock text —
+        # same heuristic used for the Shelflife bot's unconfirmed markup.
+        price = ""
+        in_stock = True
+        node = a
+        for _ in range(4):
+            if node.parent is None:
+                break
+            node = node.parent
+            text_blob = node.get_text(" ", strip=True)
+            price_match = price_re.search(text_blob)
+            if price_match and not price:
+                price = price_match.group(0)
+            if any(kw in text_blob.lower() for kw in OOS_KEYWORDS):
+                in_stock = False
+            if price:
+                break
+
+        if not price:
+            continue  # not a product card, just skip it
+
+        seen_links.add(href)
+        img_tag = a.find("img") or (a.parent.find("img") if a.parent else None)
+        image = (img_tag.get("data-src") or img_tag.get("src")) if img_tag else None
+        link = href if href.startswith("http") else store_url.split("/", 3)[0] + "//" + store_url.split("/", 3)[2] + href
+
+        products.append({
+            "id": link, "name": name, "price": price,
+            "link": link, "image": image, "in_stock": in_stock,
+        })
+
+    return products
+
+
 PLATFORM_FETCHERS = {
     "woocommerce": fetch_woocommerce,
     "magento": fetch_magento,
     "shopify": fetch_shopify,
+    "generic": fetch_generic,
 }
 
 
