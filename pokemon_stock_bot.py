@@ -97,6 +97,11 @@ STORES = [
         "platform": "generic",
         "url": "https://www.gengargames.com/pokemon-single-cards",
     },
+    {
+        "name": "Wordsworth — Pokémon",
+        "platform": "shopify",
+        "url": "https://www.wordsworth.co.za/collections/pokemon-1",
+    },
     # Add more stores here. Any WooCommerce, Magento, Shopify, or generic
     # shop works with zero code changes — just set "platform" and "url".
 ]
