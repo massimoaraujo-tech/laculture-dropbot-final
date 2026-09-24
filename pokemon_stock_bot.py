@@ -20,6 +20,10 @@ from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
+try:
+    from curl_cffi import requests as cffi   # looks like real Chrome to store firewalls
+except Exception:
+    cffi = None
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -30,7 +34,7 @@ BOT_NAME, BOT_EMOJI = "Pokémon", "🎴"
 # ---------------- Settings (all optional Railway variables) ----------------
 # Old variable names still work, so the existing Railway config doesn't break.
 WEBHOOK = os.getenv("DISCORD_WEBHOOK") or os.getenv("DISCORD_WEBHOOK_URL", "")
-WEBHOOK_30TH = os.getenv("WEBHOOK_30TH", "")        # #30th-alerts channel (Level 1 copies)
+WEBHOOK_30TH = os.getenv("WEBHOOK_30TH", "")        # #30th-alerts channel (Level 1 goes ONLY there)
 ROLE_30TH = os.getenv("ROLE_30TH_ID") or os.getenv("ANNIVERSARY_ROLE_ID", "")  # blank = @everyone
 PROXY_URL = os.getenv("PROXY_URL", "")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
@@ -65,18 +69,23 @@ STORES = [
      "url": "https://bigbangshop.co.za/collections/pokemon-trading-card-game"},
     {"name": "ThunderBolt Gaming", "platform": "woocommerce",
      "url": "https://tbgaming.co.za/shop/?per_page=-1"},
-    # NOTE: this link is Gengar's SINGLES page, so the no-singles filter will
-    # drop everything on it. Swap in their sealed-product page when you have it.
-    {"name": "Gengar Games", "platform": "generic",
-     "url": "https://www.gengargames.com/pokemon-single-cards"},
+    # Gengar Games is switched off: they rebuilt their website, so every old link
+    # (including the singles page) now returns 404, and the new site loads its
+    # products with JavaScript. Send Claude the link to their Pokémon sealed page.
+    # {"name": "Gengar Games", "platform": "generic",
+    #  "url": "PASTE-GENGAR-SEALED-OR-SEARCH-LINK-HERE"},
     {"name": "Wordsworth", "platform": "shopify",
      "url": "https://www.wordsworth.co.za/collections/pokemon-1"},
     {"name": "Legendary Loot — Preorders", "platform": "shopify",
      "url": "https://legendaryloot.co.za/collections/preorders"},
     {"name": "Rocket Grunt TCG", "platform": "woocommerce",
      "url": "https://rocketgrunttcg.co.za/shop/?per_page=-1"},
-    {"name": "Geek Zone", "platform": "woocommerce",
-     "url": "https://www.geek-zone.co.za/shop/?per_page=-1"},
+    # Geek Zone: their whole-shop page is mostly singles (and blocked bots), so we
+    # watch the two pages that matter instead.
+    {"name": "Geek Zone — 30th Anniversary", "platform": "woocommerce",
+     "url": "https://www.geek-zone.co.za/shop/pokemon-30th-anniversary/?per_page=-1"},
+    {"name": "Geek Zone — Pokémon Sealed", "platform": "woocommerce",
+     "url": "https://www.geek-zone.co.za/shop/pokemon/pokemon-sealed/?per_page=-1"},
     {"name": "Comic Warehouse", "platform": "woocommerce",
      "url": "https://comicwarehouse.co.za/product-category/shop-by-franchise/pokemon/?per_page=-1"},
     {"name": "Geekstop ZA", "platform": "shopify",
@@ -268,14 +277,15 @@ def send_alert(store, event, item):
         label = "🕒 Preorder now" if item.get("preorder") else (item.get("checkout_label") or "Add to cart")
         buttons.insert(0, (label, item["checkout_url"]))
     payload = {"content": content, "embeds": [embed], "allowed_mentions": allowed}
-    post_webhook(payload, buttons, flags=4096 if lvl == 3 else 0)   # Level 3 = silent
     if lvl == 1 and WEBHOOK_30TH:
-        post_webhook(payload, buttons, url=WEBHOOK_30TH)
+        post_webhook(payload, buttons, url=WEBHOOK_30TH)                # 30th -> #30th-alerts only
+    else:
+        post_webhook(payload, buttons, flags=4096 if lvl == 3 else 0)   # Level 3 = silent
 
 
 def short_error(e):
     t = str(e)
-    if "Failed to resolve" in t or "NameResolution" in t:
+    if "Failed to resolve" in t or "NameResolution" in t or "Could not resolve" in t:
         return "link doesn't exist"
     if "timed out" in t or "Timeout" in t:
         return "site didn't respond (timed out)"
@@ -457,11 +467,13 @@ def post_report(hot, quarantined):
                 note = rrp_note(it)
                 lines.append(f"• [{it['title'][:90]}]({it['url']}) — {price}"
                              + (f" · {note}" if note else ""))
+        post_long("\n".join(lines), url=WEBHOOK_30TH or None)     # 30th list -> #30th-alerts
+        status = [f"{BOT_EMOJI} **{BOT_NAME}** — still running. {len(hot)} 30th products in stock right now."]
     else:
-        lines = [f"{BOT_EMOJI} **{BOT_NAME}** — 30th Celebration stock check: nothing in stock right now."]
+        status = [f"{BOT_EMOJI} **{BOT_NAME}** — still running. No 30th Celebration stock right now."]
     if quarantined:
-        lines.append("\n🚫 **Quarantined (fix when you have time):** " + ", ".join(quarantined))
-    post_long("\n".join(lines))
+        status.append("🚫 **Quarantined (fix when you have time):** " + ", ".join(quarantined))
+    post_long("\n".join(status))
 
 
 # ---------------- Fetchers ----------------
@@ -479,12 +491,19 @@ def session():
     return s
 
 
+def browser_session():
+    """Chrome look-alike for store pages; helps with sites that block plain bots (403)."""
+    if cffi:
+        return cffi.Session(impersonate="chrome")
+    return session()
+
+
 def root_of(url):
     return "/".join(url.split("/")[:3])
 
 
 def get_html(url):
-    r = session().get(url, proxies=proxies(), timeout=TIMEOUT)
+    r = browser_session().get(url, proxies=proxies(), timeout=TIMEOUT)
     if r.status_code in (401, 403, 429):
         raise RuntimeError(f"{r.status_code} — blocked")
     r.raise_for_status()
@@ -597,7 +616,7 @@ def fetch_magento(store):
 def fetch_generic(store):
     soup = get_html(store["url"])
     root = root_of(store["url"])
-    price_re = re.compile(r"R\s?[\d,]+\.\d{2}")
+    price_re = re.compile(r"R\s?\d[\d\s,.]*[.,]\d{2}")   # R 1,299.00 and R 1 300,00
     items, seen = [], set()
     for a in soup.find_all("a", href=True):
         title = a.get_text(strip=True)
