@@ -1,731 +1,641 @@
 #!/usr/bin/env python3
+"""Pokémon 🎴 — original multi-platform SA Pokémon TCG tracker -> Discord.
+
+Same engine as Pikachu / Snorlax (levels, instant-checkout buttons, restock
+debounce, quarantine, 30th stock report), with this bot's own store list
+across Shopify, WooCommerce, Magento and generic sites.
+
+Takealot is NOT in here any more — it has its own standalone bot.
+Start command on Railway stays: python pokemon_stock_bot.py
 """
-Pokemon Stock Tracker -> Discord Webhook
-
-Every product is classified into one of three statuses (not just a flat
-in-stock/out-of-stock flag):
-  📦 STAGED    — visible on the site, nothing purchasable, no preorder
-                 wording. Usually means it was just published ahead of a
-                 scheduled drop — listed but sales haven't opened yet.
-  🕒 PREORDER  — preorder wording detected (title/tags/page text), whether
-                 or not it's currently purchasable.
-  ✅ LIVE      — purchasable right now, no preorder wording — a genuine
-                 immediate-stock restock or new drop.
-
-The bot alerts on two kinds of events: a brand-new listing appearing (with
-whatever status it shows up in — including STAGED, so you know something's
-been loaded ahead of a drop even before it's buyable), and any status change
-on a product it's already seen (e.g. staged -> preorder, preorder -> live).
-
-Note: a product with zero public visibility (never published to the live
-site at all) can't be detected by any scraper — there's nothing to see until
-a store actually publishes the listing, even if sales aren't open yet.
-
-Supports four store platforms:
-
-  WOOCOMMERCE (e.g. pokestore.co.za)
-    Uses the built-in `?stock_status=instock&per_page=-1` filter to fetch
-    only currently in-stock items in one request. Anything appearing in that
-    list that wasn't there last run = new stock (whether it's a brand-new
-    listing or a restock).
-
-  MAGENTO (e.g. toysrus.co.za)
-    Category pages list ALL products, including out-of-stock/"Coming Soon"
-    ones, each with a status label. We track every product's stock status
-    and alert the moment it flips from unavailable -> available. This
-    catches restocks the WooCommerce approach can't see coming.
-
-  SHOPIFY (e.g. store.nintendo.co.za, toykingdom.co.za, levelupstore.co.za,
-           bigbangshop.co.za)
-    Same proven approach as the Lemkus/Nude Project/Denim Tears bots — reads
-    the public /products.json feed Shopify exposes on every collection.
-    Every variant's availability is checked, same restock detection as
-    Magento above.
-
-  GENERIC (e.g. gengargames.com — platform unconfirmed)
-    Best-effort fallback: looks for any product-like link with a price
-    nearby and checks for out-of-stock keywords in the surrounding text.
-    Less reliable than the platform-specific fetchers — check its first-run
-    logs closely; if it parses 0 products, its real markup needs inspecting.
-
-Runs continuously with its own built-in loop (same pattern as the other
-Discord alert bots in this repo) — deploy it on Railway the same way:
-set DISCORD_WEBHOOK_URL as an environment variable and Start Command to
-`python pokemon_stock_bot.py`.
-"""
-
 import json
+import logging
 import os
+import random
 import re
 import time
-import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 
-# ---------------------------------------------------------------------------
-# CONFIG — edit this section
-# ---------------------------------------------------------------------------
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
+                    format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("pokemon")
 
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "PASTE_YOUR_WEBHOOK_URL_HERE")
+BOT_NAME, BOT_EMOJI = "Pokémon", "🎴"
 
+# ---------------- Settings (all optional Railway variables) ----------------
+# Old variable names still work, so the existing Railway config doesn't break.
+WEBHOOK = os.getenv("DISCORD_WEBHOOK") or os.getenv("DISCORD_WEBHOOK_URL", "")
+WEBHOOK_30TH = os.getenv("WEBHOOK_30TH", "")        # #30th-alerts channel (Level 1 copies)
+ROLE_30TH = os.getenv("ROLE_30TH_ID") or os.getenv("ANNIVERSARY_ROLE_ID", "")  # blank = @everyone
+PROXY_URL = os.getenv("PROXY_URL", "")
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
+WORKERS = int(os.getenv("WORKERS", "8"))
+REPORT_HOURS = float(os.getenv("REPORT_HOURS", "6"))
+OOS_CONFIRM = int(os.getenv("OOS_CONFIRM", "3"))
+COOLDOWN_HOURS = float(os.getenv("RESTOCK_COOLDOWN_HOURS", "2"))
+FAIL_LIMIT = int(os.getenv("FAIL_LIMIT", "5"))
+RETRY_HOURS = float(os.getenv("RETRY_HOURS", "24"))
+ONLY_30TH = os.getenv("ONLY_30TH", "false").lower() == "true"
+ENABLE_BUTTONS = os.getenv("ENABLE_BUTTONS", "true").lower() == "true"
+STATE_FILE = Path(os.getenv("STATE_DIR", ".")) / "state_pokemon.json"
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
+TIMEOUT = 30
+
+# ---------------- Stores ----------------
 STORES = [
-    {
-        "name": "Poké Store",
-        "platform": "woocommerce",
-        "url": "https://pokestore.co.za/shop/?orderby=date&stock_status=instock&per_page=-1",
-    },
-    {
-        "name": "Toys R Us SA — Pokémon",
-        "platform": "magento",
-        "url": "https://www.toysrus.co.za/pokemon-promo?product_list_limit=100",
-    },
-    {
-        "name": "Toys R Us SA — Trading Cards",
-        "platform": "magento",
-        "url": "https://www.toysrus.co.za/trading-cards-shop-all/pokemon?product_list_limit=100",
-    },
-    {
-        "name": "Nintendo SA — Pokémon TCG",
-        "platform": "shopify",
-        "url": "https://store.nintendo.co.za/collections/pokemon-trading-cards",
-    },
-    {
-        "name": "Toy Kingdom — Pokémon Cards",
-        "platform": "shopify",
-        "url": "https://toykingdom.co.za/collections/pokemon-cards",
-    },
-    {
-        "name": "Level Up Store — Pokémon Cards",
-        "platform": "shopify",
-        "url": "https://levelupstore.co.za/collections/pokemon-cards",
-    },
-    {
-        "name": "Big Bang Shop — Pokémon TCG",
-        "platform": "shopify",
-        "url": "https://bigbangshop.co.za/collections/pokemon-trading-card-game",
-    },
-    {
-        "name": "ThunderBolt Gaming",
-        "platform": "woocommerce",
-        "url": "https://tbgaming.co.za/?stock_status=instock&per_page=-1",
-    },
-    {
-        "name": "Gengar Games",
-        "platform": "generic",
-        "url": "https://www.gengargames.com/pokemon-single-cards",
-    },
-    {
-        "name": "Wordsworth — Pokémon",
-        "platform": "shopify",
-        "url": "https://www.wordsworth.co.za/collections/pokemon-1",
-    },
-    {
-        "name": "Legendary Loot — Preorders",
-        "platform": "shopify",
-        "url": "https://legendaryloot.co.za/collections/preorders",
-    },
-    {
-        "name": "Rocket Grunt TCG",
-        "platform": "woocommerce",
-        "url": "https://rocketgrunttcg.co.za/shop/?stock_status=instock&per_page=-1",
-    },
-    {
-        "name": "Geek Zone",
-        "platform": "woocommerce",
-        "url": "https://www.geek-zone.co.za/shop/?stock_status=instock&per_page=-1",
-    },
-    {
-        "name": "Geekstop ZA",
-        "platform": "shopify",
-        "url": "https://www.gstopza.co.za/collections/all-pokemon-cards",
-    },
-    # Add more stores here. Any WooCommerce, Magento, Shopify, or generic
-    # shop works with zero code changes — just set "platform" and "url".
+    {"name": "Poké Store", "platform": "woocommerce",
+     "url": "https://pokestore.co.za/shop/?orderby=date&per_page=-1"},
+    {"name": "Toys R Us SA — Pokémon", "platform": "magento",
+     "url": "https://www.toysrus.co.za/pokemon-promo?product_list_limit=100"},
+    {"name": "Toys R Us SA — Trading Cards", "platform": "magento",
+     "url": "https://www.toysrus.co.za/trading-cards-shop-all/pokemon?product_list_limit=100"},
+    {"name": "Nintendo SA", "platform": "shopify",
+     "url": "https://store.nintendo.co.za/collections/pokemon-trading-cards"},
+    {"name": "Toy Kingdom", "platform": "shopify",
+     "url": "https://toykingdom.co.za/collections/pokemon-cards"},
+    {"name": "Level Up Store", "platform": "shopify",
+     "url": "https://levelupstore.co.za/collections/pokemon-cards"},
+    {"name": "Big Bang Shop", "platform": "shopify",
+     "url": "https://bigbangshop.co.za/collections/pokemon-trading-card-game"},
+    {"name": "ThunderBolt Gaming", "platform": "woocommerce",
+     "url": "https://tbgaming.co.za/shop/?per_page=-1"},
+    # NOTE: this link is Gengar's SINGLES page, so the no-singles filter will
+    # drop everything on it. Swap in their sealed-product page when you have it.
+    {"name": "Gengar Games", "platform": "generic",
+     "url": "https://www.gengargames.com/pokemon-single-cards"},
+    {"name": "Wordsworth", "platform": "shopify",
+     "url": "https://www.wordsworth.co.za/collections/pokemon-1"},
+    {"name": "Legendary Loot — Preorders", "platform": "shopify",
+     "url": "https://legendaryloot.co.za/collections/preorders"},
+    {"name": "Rocket Grunt TCG", "platform": "woocommerce",
+     "url": "https://rocketgrunttcg.co.za/shop/?per_page=-1"},
+    {"name": "Geek Zone", "platform": "woocommerce",
+     "url": "https://www.geek-zone.co.za/shop/?per_page=-1"},
+    {"name": "Comic Warehouse", "platform": "woocommerce",
+     "url": "https://comicwarehouse.co.za/product-category/shop-by-franchise/pokemon/?per_page=-1"},
+    {"name": "Geekstop ZA", "platform": "shopify",
+     "url": "https://www.gstopza.co.za/collections/all-pokemon-cards"},
 ]
 
-# How often to run a full check, in seconds.
-CHECK_INTERVAL_SECONDS = 120
-
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    )
-}
-
-REQUEST_TIMEOUT = 20  # seconds
-
-OOS_KEYWORDS = ("out of stock", "coming soon", "sold out", "notify me", "pre-order notify")
-PREORDER_KEYWORDS = ("pre-order", "preorder", "pre order")
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("pokemon-bot")
-
-# ---------------------------------------------------------------------------
-# Stock status levels
-# ---------------------------------------------------------------------------
-# Every product gets classified into one of three states instead of a flat
-# in-stock/out-of-stock flag:
-#
-#   STAGED    — visible on the site, nothing purchasable, no preorder wording.
-#                Usually means the listing was just published ahead of a
-#                scheduled drop — the product "exists" but sales haven't
-#                opened yet. This is the "loaded on the backend first"
-#                signal you're looking for.
-#   PREORDER  — visible on the site with preorder language detected (in the
-#                title, tags, or page text), whether or not it's currently
-#                purchasable. Preorders ship later even when you can pay now.
-#   LIVE      — purchasable right now, no preorder wording. A genuine
-#                immediate-stock restock or new drop.
-#
-# Note: a product with zero public visibility at all (never published to the
-# live site) can't be detected by any scraper — there's nothing to see until
-# a store actually publishes the listing, even if sales aren't open yet.
-
-STATUS_STAGED = "staged"
-STATUS_PREORDER = "preorder"
-STATUS_LIVE = "live"
-
-STATUS_LABELS = {
-    STATUS_STAGED: "📦 Staged (not yet for sale)",
-    STATUS_PREORDER: "🕒 Preorder",
-    STATUS_LIVE: "✅ Live / In Stock",
-}
-
-STATUS_COLORS = {
-    STATUS_STAGED: 0x95A5A6,   # grey
-    STATUS_PREORDER: 0x9B59B6,  # purple
-    STATUS_LIVE: 0x2ECC71,      # green
-}
-
-# ---------------------------------------------------------------------------
-# Filtering & priority tiers
-# ---------------------------------------------------------------------------
-# Every product now gets sorted into one of three buckets:
-#
-#   EXCLUDED   — never alerted, never even shown in the batched summary.
-#                 Non-Pokémon TCGs (Yu-Gi-Oh, MTG, etc.) and Japanese/Chinese/
-#                 Korean import variants, since you only want English Pokémon.
-#   ROUTINE    — a normal Pokémon product, batched into the one-message-per-
-#                 store summary (unchanged from before).
-#   PRIORITY   — booster boxes, ETBs, and other big-ticket items — its own
-#                 spotlighted message, gold highlight, optional role ping.
-#   ANNIVERSARY — anything 30th Celebration related, in ANY form (binder,
-#                 poster, blister, booster, UPC, ETB, tin, whatever) — the
-#                 highest tier right now. Easy to dial back down after the
-#                 30th hype window passes: just trim ANNIVERSARY_KEYWORDS
-#                 back to nothing, or delete the block entirely.
-
-EXCLUDE_KEYWORDS = (
-    # Non-Pokémon trading card games — you only want Pokémon
-    "yu-gi-oh", "yugioh", "magic: the gathering", "magic the gathering",
-    " mtg ", "digimon", "one piece card game", "disney lorcana", "lorcana",
-    "dragon ball super card game", "dragon ball fusion world", "flesh and blood",
-    # Import language variants — English only
-    "japanese", "japan import", "(jp)", " jp ver", "chinese", "korean",
-    "(cn)", "(kr)", "s-chinese", "t-chinese",
-)
-
-# General high-value product types — always worth their own spotlight,
-# regardless of which set they belong to.
-PRIORITY_KEYWORDS = (
-    "booster box", "booster case", "elite trainer box", "etb",
-    "ascended heroes", "perfect order", "prismatic evolutions", "151",
-    "evolving skies", "binder", "poster", "blister", "upc",
-    "ultra premium collection", "premium collection", "tin",
-)
-
-# TEMPORARY — the 30th Celebration hype window. Anything matching these
-# jumps to the very top tier regardless of product type: binders, posters,
-# blister packs, boosters, UPCs, ETBs, all of it. Trim this list back to
-# empty once the 30th launch window has passed and routine priority rules
-# (above) are enough again.
-ANNIVERSARY_KEYWORDS = (
-    "30th", "30th celebration", "30th anniversary", "first partner",
-    "celebration 2026",
-)
+# ---------------- Filters: English sealed Pokémon TCG, 30th = Level 1 ----------------
+POKEMON_RE = re.compile(r"pok[eé]mon", re.I)
+TCG_RE = re.compile(
+    r"tcg|trading card|booster|elite trainer|\betb\b|\btin\b|blister|collection|"
+    r"battle deck|premium|bundle|binder|poster|display|sleeved|build (and|&) battle|"
+    r"card game|scarlet|violet|mega evolution|\bupc\b", re.I)
+EXCLUDE_RE = re.compile(
+    r"japan|japanese|\bjp\b|chinese|\bcn\b|korean|\bkr\b|simplified|yu-?gi-?oh|"
+    r"magic: the gathering|\bmtg\b|one piece|digimon|dragon ball|lorcana|flesh and blood|"
+    r"plush|nintendo switch|t-shirt|hoodie|costume|lunch ?box", re.I)
+PRIORITY_RE = re.compile(r"30th|\bcelebration\b|first partner", re.I)
+SINGLES_TITLE_RE = re.compile(
+    r"\b\d{1,3}/\d{2,3}\b|reverse holo|full art|illustration rare|secret rare|"
+    r"ultra rare|holo rare|hyper rare|\bpsa ?\d|\bcgc ?\d|\bbgs ?\d|graded|slab|"
+    r"single card", re.I)
+SINGLES_META_RE = re.compile(r"single|graded|slab|\bpsa\b|\bcgc\b|\bbgs\b", re.I)
+PREORDER_RE = re.compile(r"pre-?\s?order", re.I)
+OOS_RE = re.compile(r"out of stock|sold out|coming soon|notify me", re.I)
 
 
-def is_excluded(name: str) -> bool:
-    name_lower = (name or "").lower()
-    return any(kw in name_lower for kw in EXCLUDE_KEYWORDS)
+def is_priority(title):
+    return bool(PRIORITY_RE.search(title))
 
 
-def is_anniversary(name: str) -> bool:
-    name_lower = (name or "").lower()
-    return any(kw in name_lower for kw in ANNIVERSARY_KEYWORDS)
+def is_wanted(item):
+    title, meta = item["title"], item.get("meta") or ""
+    if SINGLES_TITLE_RE.search(title) or (meta and SINGLES_META_RE.search(meta)):
+        return False
+    # Store pages are already Pokémon-only, so a TCG word is enough when the
+    # title itself doesn't say "Pokémon" (common on SA stores).
+    everything = f"{title} {meta} {item.get('store_hint', '')}"
+    return bool(POKEMON_RE.search(everything) and TCG_RE.search(f"{title} {meta}")
+                and not EXCLUDE_RE.search(title))
 
 
-def is_priority(name: str) -> bool:
-    name_lower = (name or "").lower()
-    return any(kw in name_lower for kw in PRIORITY_KEYWORDS) or is_anniversary(name_lower)
-
-
-def classify_status(name: str, extra_text: str, in_stock: bool) -> str:
-    """Decide STAGED / PREORDER / LIVE from whatever text signals a given
-    platform's fetcher can gather (title, tags, surrounding page text)."""
-    combined = f"{name or ''} {extra_text or ''}".lower()
-    is_preorder = any(kw in combined for kw in PREORDER_KEYWORDS)
-    if is_preorder:
-        return STATUS_PREORDER
-    if in_stock:
-        return STATUS_LIVE
-    return STATUS_STAGED
-
-# ---------------------------------------------------------------------------
-# Scraping — WooCommerce
-# ---------------------------------------------------------------------------
-
-def fetch_woocommerce(store_url: str):
-    """Return products from a WooCommerce shop URL filtered to in-stock only.
-    Every product returned is treated as in_stock=True."""
-    resp = requests.get(store_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    products = []
-    items = soup.select("li.product") or soup.select(".products .product") or soup.select("div.product")
-
-    for item in items:
-        link_tag = item.select_one("a.woocommerce-LoopProduct-link, a.woocommerce-loop-product__link") \
-            or item.find("a", href=re.compile(r"/product/"))
-        if not link_tag or not link_tag.get("href"):
-            continue
-        link = link_tag["href"].split("?")[0]
-
-        title_tag = item.select_one(".woocommerce-loop-product__title, h2, h3")
-        name = title_tag.get_text(strip=True) if title_tag else link_tag.get_text(strip=True)
-        if not name:
-            continue
-
-        price_tag = item.select_one(".price")
-        price = price_tag.get_text(" ", strip=True) if price_tag else ""
-
-        cart_btn = item.select_one("[data-product_id]")
-        pid = cart_btn["data-product_id"] if cart_btn else link
-
-        img_tag = item.select_one("img")
-        image = (img_tag.get("data-src") or img_tag.get("src")) if img_tag else None
-
-        item_text = item.get_text(" ", strip=True)
-        status = classify_status(name, item_text, in_stock=True)
-
-        products.append({
-            "id": str(pid), "name": name, "price": price,
-            "link": link, "image": image, "in_stock": True, "status": status,
-        })
-
-    return products
-
-
-# ---------------------------------------------------------------------------
-# Scraping — Magento
-# ---------------------------------------------------------------------------
-
-def fetch_magento(store_url: str):
-    """Return ALL products from a Magento category page, each tagged with
-    in_stock True/False based on visible status text (Out of Stock / Coming
-    Soon / etc). Unlike WooCommerce, out-of-stock items ARE included here so
-    we can detect the moment they flip to available."""
-    resp = requests.get(store_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    products = []
-    items = soup.select("li.product-item") or soup.select("div.product-item-info")
-
-    for item in items:
-        link_tag = item.select_one("a.product-item-link") or item.select_one("strong.product-item-name a")
-        if not link_tag or not link_tag.get("href"):
-            continue
-        link = link_tag["href"].split("?")[0]
-        name = link_tag.get_text(strip=True)
-        if not name:
-            continue
-
-        price_tag = item.select_one(".price")
-        price = price_tag.get_text(" ", strip=True) if price_tag else ""
-
-        img_tag = item.select_one("img")
-        image = (img_tag.get("data-src") or img_tag.get("src")) if img_tag else None
-
-        item_text = item.get_text(" ", strip=True).lower()
-        in_stock = not any(kw in item_text for kw in OOS_KEYWORDS)
-        status = classify_status(name, item_text, in_stock)
-
-        products.append({
-            "id": link, "name": name, "price": price,
-            "link": link, "image": image, "in_stock": in_stock, "status": status,
-        })
-
-    return products
-
-
-# ---------------------------------------------------------------------------
-# Scraping — Shopify (Nintendo SA, Toy Kingdom, Level Up Store)
-# ---------------------------------------------------------------------------
-
-def fetch_shopify(store_url: str):
-    """store_url here is the base site URL plus the collection handle, e.g.
-    'https://store.nintendo.co.za/collections/pokemon-tcg'. We convert that
-    into the public /products.json feed Shopify exposes on every collection —
-    the same reliable approach used for Lemkus, Nude Project, and Denim Tears.
-    Every product's variants are checked for availability; a product counts
-    as in_stock if ANY variant is available."""
-    # Turn ".../collections/<handle>" into ".../collections/<handle>/products.json"
-    base = store_url.split("?")[0].rstrip("/")
-    json_url = f"{base}/products.json"
-
-    products = []
-    page = 1
-    while True:
-        resp = requests.get(json_url, params={"limit": 250, "page": page}, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json().get("products", [])
-        if not data:
-            break
-
-        for p in data:
-            variants = p.get("variants", [])
-            in_stock = any(v.get("available") for v in variants)
-            price = ""
+# ---------------- RRP check for 30th items ----------------
+def _load_rrp():
+    raw = os.getenv("RRP_30TH", "elite trainer=1299|booster bundle=699|sticker=499|mini tin=299")
+    out = []
+    for part in raw.split("|"):
+        if "=" in part:
+            k, v = part.split("=", 1)
             try:
-                price = f"R{float(variants[0]['price']):,.2f}"
-            except (IndexError, KeyError, ValueError, TypeError):
+                out.append((k.strip().lower(), float(v)))
+            except ValueError:
                 pass
-            image = None
-            if p.get("images"):
-                image = p["images"][0].get("src")
+    return out
 
-            # Reconstruct the product page URL from the store's root domain
-            root = "/".join(base.split("/")[:3])  # https://domain.com
-            link = f"{root}/products/{p['handle']}"
 
-            # Shopify exposes tags/product_type — a strong, explicit signal
-            # for preorders that most stores label consistently.
-            extra_text = f"{p.get('tags', '')} {p.get('product_type', '')}"
-            status = classify_status(p["title"], extra_text, in_stock)
+RRP_30TH = _load_rrp()
 
-            products.append({
-                "id": str(p["id"]), "name": p["title"], "price": price,
-                "link": link, "image": image, "in_stock": in_stock, "status": status,
+
+def money(text):
+    """'R 1,299.00' -> 1299.0"""
+    if text is None:
+        return None
+    if isinstance(text, (int, float)):
+        return float(text)
+    m = re.search(r"R\s?([\d\s.,]+)", str(text)) or re.search(r"([\d][\d\s.,]*)", str(text))
+    if not m:
+        return None
+    t = re.sub(r"[^\d.,]", "", m.group(1))
+    if re.search(r",\d{2}$", t):
+        t = t.replace(".", "").replace(",", ".")
+    t = t.replace(",", "")
+    try:
+        return float(t) if t else None
+    except ValueError:
+        return None
+
+
+def rrp_note(item):
+    if not is_priority(item["title"]) or not item.get("price_value"):
+        return None
+    low = item["title"].lower()
+    for key, rrp in RRP_30TH:
+        if key in low:
+            diff = item["price_value"] - rrp
+            if diff <= rrp * 0.05:
+                return f"✅ At RRP (R{rrp:,.0f})"
+            return f"⚠️ R{diff:,.0f} above RRP (R{rrp:,.0f})"
+    return None
+
+
+def fmt_price(v):
+    return f"R {v:,.2f}" if v else "—"
+
+
+# ---------------- Discord ----------------
+def post_webhook(payload, buttons=None, flags=0, url=None):
+    url = url or WEBHOOK
+    if not url:
+        log.error("DISCORD_WEBHOOK not set")
+        return
+    payload = dict(payload)
+    target = url
+    if flags:
+        payload["flags"] = flags
+    if buttons and ENABLE_BUTTONS:
+        payload["components"] = [{"type": 1, "components": [
+            {"type": 2, "style": 5, "label": l[:80], "url": u} for l, u in buttons[:5]]}]
+        target = url + ("&" if "?" in url else "?") + "with_components=true"
+    for _ in range(4):
+        try:
+            r = requests.post(target, json=payload, timeout=15)
+        except Exception as e:
+            log.warning("Discord post failed: %s", e)
+            return
+        if r.status_code == 429:
+            time.sleep(float(r.json().get("retry_after", 2)))
+            continue
+        if r.status_code >= 400 and ("components" in payload or "flags" in payload):
+            payload.pop("components", None)     # fall back to a plain message
+            payload.pop("flags", None)
+            target = url
+            continue
+        if r.status_code >= 400:
+            log.error("Discord error %s: %s", r.status_code, r.text[:200])
+        return
+
+
+def post_long(text, url=None):
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) + 1 > 1900:
+            post_webhook({"content": chunk}, url=url)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        post_webhook({"content": chunk}, url=url)
+
+
+def mention():
+    return f"<@&{ROLE_30TH}>" if ROLE_30TH else "@everyone"
+
+
+BADGE = {1: "🔴 LEVEL 1 · 30TH CELEBRATION", 2: "🟢 LEVEL 2 · IN STOCK",
+         3: "⚪ LEVEL 3 · LISTED (not in stock yet)"}
+COLOR = {1: 0xE3350D, 2: 0x2ECC71, 3: 0x95A5A6}
+EVENT_ICON = {"NEW LISTING": "🆕", "RESTOCK": "🔁", "PRICE DROP": "📉", "TEST ALERT": "🧪"}
+
+
+def level_of(item):
+    if is_priority(item["title"]):
+        return 1
+    return 2 if item["in_stock"] else 3
+
+
+def send_alert(store, event, item):
+    lvl = level_of(item)
+    fields = [
+        {"name": "Price", "value": fmt_price(item.get("price_value")) if item.get("price_value")
+         else (item.get("price") or "—"), "inline": True},
+        {"name": "Stock", "value": "✅ In stock" if item["in_stock"] else "❌ Out of stock",
+         "inline": True},
+        {"name": "Store", "value": store, "inline": True},
+    ]
+    if item.get("preorder"):
+        fields.append({"name": "Type", "value": "🕒 Preorder", "inline": True})
+    if item.get("was"):
+        fields.append({"name": "Was", "value": fmt_price(item["was"]), "inline": True})
+    note = rrp_note(item)
+    if note:
+        fields.append({"name": "RRP check", "value": note, "inline": True})
+    embed = {
+        "title": item["title"][:256], "url": item["url"], "color": COLOR[lvl],
+        "description": f"**{BADGE[lvl]}**\n{EVENT_ICON.get(event, '')} {event}",
+        "fields": fields,
+        "footer": {"text": f"{BOT_EMOJI} {BOT_NAME} • {store}"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if item.get("image"):
+        embed["image" if lvl == 1 else "thumbnail"] = {"url": item["image"]}
+    if lvl == 1:
+        content = f"{mention()} 🔥 **30th Celebration {event}** — {store}"
+    else:
+        content = f"{EVENT_ICON.get(event, '')} **{event}** — {store}"
+    allowed = {"parse": ["everyone"]}
+    if ROLE_30TH:
+        allowed["roles"] = [ROLE_30TH]
+    buttons = [(f"Open on {store}"[:80], item["url"])]
+    if item.get("checkout_url") and item["in_stock"]:
+        label = "🕒 Preorder now" if item.get("preorder") else (item.get("checkout_label") or "Add to cart")
+        buttons.insert(0, (label, item["checkout_url"]))
+    payload = {"content": content, "embeds": [embed], "allowed_mentions": allowed}
+    post_webhook(payload, buttons, flags=4096 if lvl == 3 else 0)   # Level 3 = silent
+    if lvl == 1 and WEBHOOK_30TH:
+        post_webhook(payload, buttons, url=WEBHOOK_30TH)
+
+
+def short_error(e):
+    t = str(e)
+    if "Failed to resolve" in t or "NameResolution" in t:
+        return "link doesn't exist"
+    if "timed out" in t or "Timeout" in t:
+        return "site didn't respond (timed out)"
+    if "SSL" in t or "certificate" in t:
+        return "site's security certificate is broken"
+    if "Expecting value" in t:
+        return "didn't return product data"
+    return t.split("\n")[0][:120]
+
+
+# ---------------- State ----------------
+def load_state():
+    try:
+        s = json.loads(STATE_FILE.read_text())
+    except Exception:
+        s = {}
+    s.setdefault("products", {})
+    s.setdefault("stores", {})
+    s.setdefault("seeded", [])
+    return s
+
+
+def save_state(state):
+    try:
+        STATE_FILE.write_text(json.dumps(state))
+    except Exception as e:
+        log.warning("Could not save state: %s", e)
+
+
+def handle_item(state, store, key, item, seeded, now):
+    old = state["products"].get(item["id"])
+    pv = item.get("price_value")
+    event = None
+    if old is None:
+        event = "NEW LISTING"
+        rec = {"in_stock": item["in_stock"], "oos": 0, "last_alert": 0, "price": pv}
+    else:
+        rec = dict(old)
+        rec.setdefault("oos", 0)
+        rec.setdefault("last_alert", 0)
+        if item["in_stock"]:
+            if not old.get("in_stock"):
+                event = "RESTOCK"
+            rec["in_stock"], rec["oos"] = True, 0
+            prev = old.get("price")
+            if event is None and pv and prev and pv <= prev * 0.95 and prev - pv >= 20:
+                event, item["was"] = "PRICE DROP", prev
+        else:
+            rec["oos"] += 1
+            if rec["oos"] >= OOS_CONFIRM:
+                rec["in_stock"] = False
+        if pv:
+            rec["price"] = pv
+    rec["store"] = key
+    if event in ("RESTOCK", "PRICE DROP") and now - rec["last_alert"] < COOLDOWN_HOURS * 3600:
+        event = None
+    if event and seeded and (not ONLY_30TH or is_priority(item["title"])):
+        send_alert(store, event, item)
+        rec["last_alert"] = now
+    state["products"][item["id"]] = rec
+
+
+def mark_missing(state, key, seen_ids):
+    """Products that vanish from a store page (common when a sold-out item gets
+    hidden) count as a sold-out check, so they can fire RESTOCK when they return."""
+    for pid, rec in state["products"].items():
+        if rec.get("store") == key and pid not in seen_ids and rec.get("in_stock"):
+            rec["oos"] = rec.get("oos", 0) + 1
+            if rec["oos"] >= OOS_CONFIRM:
+                rec["in_stock"] = False
+
+
+# ---------------- Main loop ----------------
+def run(get_stores, fetch, parallel=True):
+    state = load_state()
+    if os.getenv("TEST_ALERT") == "1":
+        send_alert("Test Store", "TEST ALERT", {
+            "title": "Pokémon TCG: 30th Celebration Elite Trainer Box (test)",
+            "url": "https://store.nintendo.co.za", "price_value": 1299.0,
+            "in_stock": True, "image": None, "checkout_url": "https://store.nintendo.co.za",
+            "checkout_label": "⚡ Checkout now"})
+    startup, last_report = True, 0.0
+    while True:
+        now = time.time()
+        stores = get_stores()
+        active = []
+        for name, key, opts in stores:
+            rec = state["stores"].setdefault(key, {"fails": 0, "quarantined": False, "since": 0})
+            if rec["quarantined"] and not startup and now - rec["since"] < RETRY_HOURS * 3600:
+                continue
+            active.append((name, key, opts))
+
+        results = {}
+        if parallel and len(active) > 1:
+            with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+                futs = {k: pool.submit(fetch, k, o) for _, k, o in active}
+                for k, f in futs.items():
+                    try:
+                        results[k] = f.result()
+                    except Exception as e:
+                        results[k] = e
+        else:
+            for _, k, o in active:
+                try:
+                    results[k] = fetch(k, o)
+                except Exception as e:
+                    results[k] = e
+
+        ok, failed, tracked, in_stock, pri, hot = 0, [], 0, 0, 0, []
+        for name, key, opts in active:
+            rec, res = state["stores"][key], results.get(key)
+            if isinstance(res, Exception):
+                reason = short_error(res)
+                rec["fails"] += 1
+                log.warning("%s failed (%d in a row): %s", name, rec["fails"], res)
+                failed.append(f"{name} — {reason}")
+                if rec["quarantined"]:
+                    rec["since"] = now
+                elif rec["fails"] >= FAIL_LIMIT:
+                    rec.update(quarantined=True, since=now)
+                    post_webhook({"content": f"🚫 **{name} quarantined** — failed {rec['fails']} checks "
+                                             f"in a row ({reason}). Skipping it so the other stores "
+                                             f"keep running; retrying every {RETRY_HOURS:g}h. "
+                                             f"Fix its link in STORES when you have time."})
+                continue
+            if rec["quarantined"]:
+                post_webhook({"content": f"✅ **{name} is working again** — back on the watchlist."})
+            rec.update(fails=0, quarantined=False)
+            ok += 1
+            seeded = key in state["seeded"]
+            seen = set()
+            for item in res:
+                if not is_wanted(item):
+                    continue
+                seen.add(item["id"])
+                tracked += 1
+                in_stock += item["in_stock"]
+                if is_priority(item["title"]):
+                    pri += 1
+                    if item["in_stock"]:
+                        hot.append((name, item))
+                handle_item(state, name, key, item, seeded, now)
+            if seen:                       # empty page = likely a parse glitch, don't touch stock
+                mark_missing(state, key, seen)
+            else:
+                log.warning("%s: 0 Pokémon TCG products parsed — markup may have changed.", name)
+            if not seeded:
+                state["seeded"].append(key)
+        save_state(state)
+        log.info("Round done: %d/%d OK, %d tracked", ok, len(active), tracked)
+
+        if startup:
+            mode = "30th Celebration only" if ONLY_30TH else "all Pokémon TCG, 30th = Level 1"
+            msg = (f"{BOT_EMOJI} **{BOT_NAME} online** ({mode}) — {ok}/{len(active)} stores working, "
+                   f"tracking {tracked} Pokémon TCG products ({in_stock} in stock, {pri} 30th Celebration).")
+            if failed:
+                msg += (f"\n\n**Not working (auto-quarantined after {FAIL_LIMIT} failed checks):**\n"
+                        + "\n".join(f"• {f}" for f in failed))
+            post_long(msg)
+            startup = False
+
+        if now - last_report >= REPORT_HOURS * 3600:
+            post_report(hot, [n for n, k, _ in stores if state["stores"].get(k, {}).get("quarantined")])
+            last_report = now
+        time.sleep(POLL_SECONDS * random.uniform(0.8, 1.2))
+
+
+def post_report(hot, quarantined):
+    if hot:
+        by_store = {}
+        for store, item in hot:
+            by_store.setdefault(store, []).append(item)
+        lines = [f"🔥 **{BOT_EMOJI} {BOT_NAME} — 30th Celebration IN STOCK right now** "
+                 f"({len(hot)} products at {len(by_store)} stores)"]
+        for store in sorted(by_store):
+            lines.append(f"\n**{store}**")
+            for it in sorted(by_store[store], key=lambda x: x["title"]):
+                price = fmt_price(it.get("price_value")) if it.get("price_value") else (it.get("price") or "—")
+                note = rrp_note(it)
+                lines.append(f"• [{it['title'][:90]}]({it['url']}) — {price}"
+                             + (f" · {note}" if note else ""))
+    else:
+        lines = [f"{BOT_EMOJI} **{BOT_NAME}** — 30th Celebration stock check: nothing in stock right now."]
+    if quarantined:
+        lines.append("\n🚫 **Quarantined (fix when you have time):** " + ", ".join(quarantined))
+    post_long("\n".join(lines))
+
+
+# ---------------- Fetchers ----------------
+def get_stores():
+    return [(s["name"], s["name"], s) for s in STORES]
+
+
+def proxies():
+    return {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+
+
+def session():
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA})
+    return s
+
+
+def root_of(url):
+    return "/".join(url.split("/")[:3])
+
+
+def get_html(url):
+    r = session().get(url, proxies=proxies(), timeout=TIMEOUT)
+    if r.status_code in (401, 403, 429):
+        raise RuntimeError(f"{r.status_code} — blocked")
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
+
+
+def fetch_shopify(store):
+    base = store["url"].split("?")[0].rstrip("/")
+    root = root_of(base)
+    domain = root.split("//")[1]
+    s = session()
+    items = []
+    for page in range(1, 11):
+        r = s.get(f"{base}/products.json", params={"limit": 250, "page": page},
+                  proxies=proxies(), timeout=TIMEOUT)
+        if r.status_code == 404:
+            raise RuntimeError("404 — collection link is wrong")
+        if r.status_code in (401, 403, 429):
+            raise RuntimeError(f"{r.status_code} — blocked")
+        r.raise_for_status()
+        batch = r.json().get("products") or []
+        for p in batch:
+            variants = p.get("variants") or []
+            prices = [float(v["price"]) for v in variants if v.get("price")]
+            avail = [v for v in variants if v.get("available")]
+            tags = p.get("tags")
+            tags = " ".join(tags) if isinstance(tags, list) else str(tags or "")
+            images = p.get("images") or []
+            meta = f"{p.get('product_type') or ''} {p.get('vendor') or ''} {tags}"
+            items.append({
+                "id": f"{domain}:{p['id']}", "title": p.get("title") or "",
+                "url": f"{root}/products/{p.get('handle')}",
+                "price_value": min(prices) if prices else None,
+                "in_stock": bool(avail),
+                "preorder": bool(PREORDER_RE.search(f"{p.get('title', '')} {meta}")),
+                "image": images[0].get("src") if images else None,
+                "meta": meta, "store_hint": "pokemon",
+                "checkout_url": f"{root}/cart/{avail[0]['id']}:1" if avail else None,
+                "checkout_label": "⚡ Checkout now",
             })
-
-        if len(data) < 250:
+        if len(batch) < 250:
             break
-        page += 1
+        time.sleep(1)
+    return items
 
-    return products
+
+def fetch_woocommerce(store):
+    soup = get_html(store["url"])
+    root = root_of(store["url"])
+    items = []
+    for li in soup.select("li.product") or soup.select(".products .product"):
+        a = (li.select_one("a.woocommerce-LoopProduct-link, a.woocommerce-loop-product__link")
+             or li.find("a", href=re.compile(r"/product/")))
+        if not a or not a.get("href"):
+            continue
+        link = a["href"].split("?")[0]
+        t = li.select_one(".woocommerce-loop-product__title, h2, h3")
+        title = t.get_text(strip=True) if t else a.get_text(strip=True)
+        if not title:
+            continue
+        classes = " ".join(li.get("class") or [])
+        text = li.get_text(" ", strip=True)
+        in_stock = "outofstock" not in classes and not OOS_RE.search(text)
+        btn = li.select_one("[data-product_id]")
+        pid = btn["data-product_id"] if btn else None
+        simple = bool(btn and "add_to_cart_button" in " ".join(btn.get("class") or [])
+                      and "product_type_simple" in " ".join(btn.get("class") or []))
+        img = li.select_one("img")
+        price_tag = li.select_one(".price ins .amount") or li.select_one(".price .amount") \
+            or li.select_one(".price")
+        price = price_tag.get_text(" ", strip=True) if price_tag else ""
+        items.append({
+            "id": f"{root}:{pid or link}", "title": title, "url": link,
+            "price": price, "price_value": money(price), "in_stock": in_stock,
+            "preorder": bool(PREORDER_RE.search(text)),
+            "image": (img.get("data-src") or img.get("src")) if img else None,
+            "meta": classes, "store_hint": "pokemon",
+            # adds 1 to cart and lands on checkout — simple products only
+            "checkout_url": f"{root}/checkout/?add-to-cart={pid}" if (pid and simple and in_stock) else None,
+            "checkout_label": "⚡ Checkout now",
+        })
+    return items
 
 
-# ---------------------------------------------------------------------------
-# Scraping — Generic best-effort (unconfirmed platforms, e.g. Gengar Games)
-# ---------------------------------------------------------------------------
+def fetch_magento(store):
+    soup = get_html(store["url"])
+    items = []
+    for li in soup.select("li.product-item") or soup.select("div.product-item-info"):
+        a = li.select_one("a.product-item-link") or li.select_one("strong.product-item-name a")
+        if not a or not a.get("href"):
+            continue
+        link = a["href"].split("?")[0]
+        title = a.get_text(strip=True)
+        if not title:
+            continue
+        text = li.get_text(" ", strip=True)
+        price_tag = li.select_one(".price")
+        price = price_tag.get_text(" ", strip=True) if price_tag else ""
+        img = li.select_one("img")
+        items.append({
+            "id": link, "title": title, "url": link, "price": price,
+            "price_value": money(price), "in_stock": not OOS_RE.search(text),
+            "preorder": bool(PREORDER_RE.search(text)),
+            "image": (img.get("data-src") or img.get("src")) if img else None,
+            "meta": "", "store_hint": "pokemon",
+        })
+    return items
 
-def fetch_generic(store_url: str):
-    """Best-effort fallback for stores whose exact platform isn't confirmed.
-    Looks for any product-card-like link with visible text, then checks the
-    surrounding container for a price and any out-of-stock keyword. Less
-    reliable than the platform-specific fetchers above — if this store
-    consistently parses 0 products, its real markup needs to be inspected
-    and a proper selector added."""
-    resp = requests.get(store_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
 
-    products = []
-    seen_links = set()
+def fetch_generic(store):
+    soup = get_html(store["url"])
+    root = root_of(store["url"])
     price_re = re.compile(r"R\s?[\d,]+\.\d{2}")
-
+    items, seen = [], set()
     for a in soup.find_all("a", href=True):
-        name = a.get_text(strip=True)
-        if not name or len(name) < 3:
-            continue
+        title = a.get_text(strip=True)
         href = a["href"]
-        if href in seen_links:
+        if not title or len(title) < 3 or href in seen:
             continue
-
-        # Walk up a few parent levels looking for a price and stock text —
-        # same heuristic used for the Shelflife bot's unconfirmed markup.
-        price = ""
-        in_stock = True
-        combined_text = ""
-        node = a
+        price, blob, node = "", "", a
         for _ in range(4):
             if node.parent is None:
                 break
             node = node.parent
-            text_blob = node.get_text(" ", strip=True)
-            combined_text = text_blob  # widest blob wins, accumulates naturally going up
-            price_match = price_re.search(text_blob)
-            if price_match and not price:
-                price = price_match.group(0)
-            if any(kw in text_blob.lower() for kw in OOS_KEYWORDS):
-                in_stock = False
-            if price:
+            blob = node.get_text(" ", strip=True)
+            m = price_re.search(blob)
+            if m:
+                price = m.group(0)
                 break
-
         if not price:
-            continue  # not a product card, just skip it
-
-        seen_links.add(href)
-        img_tag = a.find("img") or (a.parent.find("img") if a.parent else None)
-        image = (img_tag.get("data-src") or img_tag.get("src")) if img_tag else None
-        link = href if href.startswith("http") else store_url.split("/", 3)[0] + "//" + store_url.split("/", 3)[2] + href
-        status = classify_status(name, combined_text, in_stock)
-
-        products.append({
-            "id": link, "name": name, "price": price,
-            "link": link, "image": image, "in_stock": in_stock, "status": status,
+            continue
+        seen.add(href)
+        link = href if href.startswith("http") else root + ("" if href.startswith("/") else "/") + href
+        img = a.find("img") or (a.parent.find("img") if a.parent else None)
+        items.append({
+            "id": link, "title": title, "url": link, "price": price,
+            "price_value": money(price), "in_stock": not OOS_RE.search(blob),
+            "preorder": bool(PREORDER_RE.search(blob)),
+            "image": (img.get("data-src") or img.get("src")) if img else None,
+            "meta": "", "store_hint": "pokemon",
         })
-
-    return products
-
-
-PLATFORM_FETCHERS = {
-    "woocommerce": fetch_woocommerce,
-    "magento": fetch_magento,
-    "shopify": fetch_shopify,
-    "generic": fetch_generic,
-}
+    return items
 
 
-def fetch_products(store: dict):
-    fetcher = PLATFORM_FETCHERS.get(store["platform"])
-    if not fetcher:
-        raise ValueError(f"Unknown platform: {store['platform']}")
-    return fetcher(store["url"])
+FETCHERS = {"shopify": fetch_shopify, "woocommerce": fetch_woocommerce,
+            "magento": fetch_magento, "generic": fetch_generic}
 
 
-# ---------------------------------------------------------------------------
-# State handling
-# ---------------------------------------------------------------------------
-
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {}
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# Discord
-# ---------------------------------------------------------------------------
-
-def send_discord_alert(store_name: str, product: dict, reason: str, previous_status: str = None):
-    """reason is either 'new_listing' (first time we've ever seen this
-    product) or 'status_change' (we've seen it before, but its status moved
-    — e.g. staged -> preorder, preorder -> live, staged -> live)."""
-    if not DISCORD_WEBHOOK_URL or "PASTE_YOUR" in DISCORD_WEBHOOK_URL:
-        log.warning("No Discord webhook configured — would have alerted: %s", product["name"])
-        return
-
-    status = product.get("status", STATUS_LIVE)
-    status_label = STATUS_LABELS.get(status, status)
-    color = STATUS_COLORS.get(status, 0xE3350D)
-    priority = is_priority(product["name"])
-
-    if reason == "new_listing":
-        header = f"🆕 New listing spotted at {store_name}"
-        description = f"**{product['price']}**\nStatus: **{status_label}**"
-        if status == STATUS_STAGED:
-            description += "\n_Just appeared on the site but isn't purchasable yet — possibly staged ahead of a scheduled drop._"
-    else:
-        prev_label = STATUS_LABELS.get(previous_status, previous_status or "unknown")
-        header = f"🔁 Status change at {store_name}"
-        description = f"**{product['price']}**\n{prev_label} → **{status_label}**"
-
-    if is_anniversary(product["name"]):
-        header = f"🎉 30TH CELEBRATION — {header}"
-        color = 0xFF69B4  # pink, distinct from the standard priority gold
-        role_id = os.environ.get("ANNIVERSARY_ROLE_ID", "") or os.environ.get("PRIORITY_ROLE_ID", "")
-        content_prefix = f"<@&{role_id}> " if role_id else ""
-    elif priority:
-        header = f"🔥 PRIORITY — {header}"
-        color = 0xF1C40F  # gold, overrides the normal status color for visibility
-        # Optional: ping a role for priority items only. Set PRIORITY_ROLE_ID
-        # as an environment variable (the role's numeric Discord ID) to
-        # enable this — leave unset to just get the gold highlight with no ping.
-        role_id = os.environ.get("PRIORITY_ROLE_ID", "")
-        content_prefix = f"<@&{role_id}> " if role_id else ""
-    else:
-        content_prefix = ""
-
-    embed = {
-        "title": product["name"],
-        "url": product["link"],
-        "description": description,
-        "color": color,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    if product.get("image"):
-        embed["thumbnail"] = {"url": product["image"]}
-
-    payload = {"content": f"{content_prefix}**{header}**", "embeds": [embed]}
-
-    try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        log.error("Failed to send Discord alert for %s: %s", product["name"], e)
-
-
-def send_batched_alert(store_name: str, changes: list):
-    """changes is a list of (reason, product, previous_status) tuples for
-    ordinary (non-priority) items from ONE store in ONE check cycle. Instead
-    of one Discord message per product, this sends a single message with
-    one field per change — much less noisy when several things move at once."""
-    if not DISCORD_WEBHOOK_URL or "PASTE_YOUR" in DISCORD_WEBHOOK_URL:
-        return
-    if not changes:
-        return
-
-    fields = []
-    for reason, product, previous_status in changes[:25]:  # Discord's field cap
-        status = product.get("status", STATUS_LIVE)
-        status_label = STATUS_LABELS.get(status, status)
-        if reason == "new_listing":
-            value = f"[{product['price']}]({product['link']}) — New, status: {status_label}"
-        else:
-            prev_label = STATUS_LABELS.get(previous_status, previous_status or "unknown")
-            value = f"[{product['price']}]({product['link']}) — {prev_label} → {status_label}"
-        fields.append({"name": product["name"][:256], "value": value, "inline": False})
-
-    overflow = len(changes) - len(fields)
-    embed = {
-        "title": f"📋 {len(changes)} update(s) at {store_name}",
-        "color": 0x3498DB,
-        "fields": fields,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    if overflow > 0:
-        embed["footer"] = {"text": f"+{overflow} more not shown — check the site directly"}
-
-    payload = {"embeds": [embed]}
-    try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        log.error("Failed to send batched alert for %s: %s", store_name, e)
-
-
-def post_startup_message():
-    if not DISCORD_WEBHOOK_URL or "PASTE_YOUR" in DISCORD_WEBHOOK_URL:
-        return
-    store_names = ", ".join(s["name"] for s in STORES)
-    payload = {
-        "embeds": [{
-            "title": "✅ Pokémon Stock Bot is online",
-            "description": f"Watching: {store_names}\nChecking every {CHECK_INTERVAL_SECONDS}s.",
-            "color": 0x95A5A6,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }]
-    }
-    try:
-        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as e:
-        log.error("Failed to post startup message: %s", e)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def run_once():
-    state = load_state()
-    total_new = 0
-
-    for store in STORES:
-        name = store["name"]
-        try:
-            current = fetch_products(store)
-        except requests.RequestException as e:
-            log.error("Could not fetch %s: %s", name, e)
-            continue
-        except ValueError as e:
-            log.error(str(e))
-            continue
-
-        if not current:
-            log.warning("%s: parsed 0 products — the site's markup may not match "
-                        "the selectors used. Send this to Claude to fix.", name)
-            continue
-
-        excluded_count = sum(1 for p in current if is_excluded(p["name"]))
-        current = [p for p in current if not is_excluded(p["name"])]
-        if excluded_count:
-            log.info("%s: filtered out %d excluded product(s) (non-Pokémon TCG or import variant).",
-                      name, excluded_count)
-        if not current:
-            continue
-
-        previous = state.get(name, {})
-        first_run = name not in state
-        current_by_id = {p["id"]: p for p in current}
-        routine_changes = []  # (reason, product, previous_status) — batched together
-        store_changes = 0
-
-        for pid, product in current_by_id.items():
-            product.setdefault("status", STATUS_LIVE if product.get("in_stock") else STATUS_STAGED)
-            prev_entry = previous.get(pid)
-
-            if prev_entry is None:
-                # Brand new listing we've never seen before. Only alert once
-                # we're past the very first run (otherwise the whole existing
-                # catalog would fire as "new" the moment the bot starts).
-                if not first_run:
-                    log.info("NEW LISTING — %s: %s (%s)", name, product["name"], product["status"])
-                    if is_priority(product["name"]):
-                        send_discord_alert(name, product, reason="new_listing")
-                    else:
-                        routine_changes.append(("new_listing", product, None))
-                    store_changes += 1
-            else:
-                prev_status = prev_entry.get("status", STATUS_STAGED)
-                if product["status"] != prev_status:
-                    log.info("STATUS CHANGE — %s: %s (%s -> %s)",
-                             name, product["name"], prev_status, product["status"])
-                    if is_priority(product["name"]):
-                        send_discord_alert(name, product, reason="status_change", previous_status=prev_status)
-                    else:
-                        routine_changes.append(("status_change", product, prev_status))
-                    store_changes += 1
-
-        if routine_changes:
-            send_batched_alert(name, routine_changes)
-
-        if first_run:
-            log.info("%s: first run, recorded %d products as baseline.", name, len(current_by_id))
-        elif store_changes == 0:
-            log.info("%s: no changes (%d products tracked).", name, len(current_by_id))
-
-        total_new += store_changes
-        state[name] = current_by_id
-
-    save_state(state)
-    return total_new
-
-
-def main():
-    log.info("Starting Pokémon stock bot. Watching %d store(s).", len(STORES))
-    post_startup_message()
-    while True:
-        try:
-            run_once()
-        except Exception as e:
-            log.error("Unexpected error during check: %s", e)
-        log.info("Sleeping %ss...", CHECK_INTERVAL_SECONDS)
-        time.sleep(CHECK_INTERVAL_SECONDS)
+def fetch(key, store):
+    return FETCHERS[store["platform"]](store)
 
 
 if __name__ == "__main__":
-    main()
+    run(get_stores, fetch, parallel=True)
